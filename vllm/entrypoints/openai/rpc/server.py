@@ -11,7 +11,8 @@ from typing_extensions import Never
 from zmq import Frame  # type: ignore[attr-defined]
 from zmq.asyncio import Socket
 
-from vllm import AsyncEngineArgs, AsyncLLMEngine
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig)
 from vllm.entrypoints.openai.rpc import (VLLM_RPC_SUCCESS_STR,
