@@ -52,6 +52,20 @@ from .interfaces import SupportsLoRA
 from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers
 
 
+def _is_moe(config: PretrainedConfig) -> bool:
+    if getattr(config, "num_experts", None) and \
+        ((isinstance(config.num_experts, int) and config.num_experts > 1) or \
+         (isinstance(config.num_experts, list) and max(config.num_experts) > 1)):
+        return True
+    else:
+        return False
+
+def _get_cla_factor(config: PretrainedConfig) -> int:
+    if not getattr(config, "use_cla", False):
+        return 1
+    return  getattr(config, "cla_share_factor", 1)
+
+
 class HunYuanMLP(nn.Module):
 
     def __init__(
@@ -190,7 +204,7 @@ class HunYuanAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.use_qk_norm = config.use_qk_norm
+        self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.attention_type = attention_type
 
         if attention_type == "self":
@@ -292,7 +306,10 @@ class HunYuanDecoderLayer(nn.Module):
         layer_id: int = -1,
     ) -> None:
         super().__init__()
+        assert layer_id >= 0
         self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size \
+            if isinstance(config.intermediate_size, int) else config.intermediate_size[layer_id]
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
@@ -305,7 +322,7 @@ class HunYuanDecoderLayer(nn.Module):
         # Support internlm/internlm-7b with bias
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False)
-        cla_factor = getattr(config, "cla_share_factor", 1)
+        cla_factor = _get_cla_factor(config)
         attention_type = "cross" \
             if layer_id >= 0 and layer_id % cla_factor != 0 else "self"
         self.self_attn = HunYuanAttention(
@@ -323,7 +340,7 @@ class HunYuanDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             attention_type=attention_type,
         )
-        if getattr(config, "num_experts", None):
+        if _is_moe(config):
             self.mlp = HunYuanSparseMoeBlock(config=config,
                                              quant_config=quant_config)
         else:
@@ -435,7 +452,7 @@ class HunYuanModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        cla_factor = getattr(self.config, "cla_share_factor", 1)
+        cla_factor = _get_cla_factor(self.config)
         prev_kv_states = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -581,8 +598,22 @@ class HunYuanForCausalLM(nn.Module, SupportsLoRA):
                         device=device),
         })
 
+    def _split_qkv_weight(self, qkv: torch.Tensor):
+        num_attention_heads = self.config.num_attention_heads
+        num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
+        num_key_value_groups = num_attention_heads // num_kv_heads
+        hidden_size = self.config.hidden_size
+        attention_head_dim = self.config.hidden_size // num_attention_heads
+
+        qkv = qkv.reshape(num_kv_heads, num_key_value_groups + 2, attention_head_dim, hidden_size)
+        q, k, v = torch.split(qkv, (num_key_value_groups, 1, 1), dim=1)
+        q = q.reshape(-1, hidden_size)
+        k = k.reshape(-1, hidden_size)
+        v = v.reshape(-1, hidden_size)
+        return torch.concat((q, k, v))
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        cla_factor = getattr(self.config, "cla_share_factor", 1)
+        cla_factor = _get_cla_factor(self.config)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -592,7 +623,18 @@ class HunYuanForCausalLM(nn.Module, SupportsLoRA):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-        if getattr(self.config, "num_experts", None):
+        num_attention_heads = self.config.num_attention_heads
+        num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
+        split_params_mapping = [
+            (".gate_up_proj", ".gate_and_up_proj", 2, [(1, 1), (0, 1)], None),
+            (".qkv_proj", ".qkv_proj",
+                num_attention_heads + num_kv_heads * 2,
+                [("q", num_attention_heads), ("k", num_kv_heads), ("v", num_kv_heads)],
+                self._split_qkv_weight,
+            ),
+        ]
+
+        if _is_moe(self.config):
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
             expert_params_mapping = FusedMoE.make_expert_params_mapping(
@@ -625,6 +667,8 @@ class HunYuanForCausalLM(nn.Module, SupportsLoRA):
                 loaded_weight = loaded_weight[0]
                 weight_loader(param, loaded_weight)
                 continue
+
+            is_found = False
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -648,6 +692,36 @@ class HunYuanForCausalLM(nn.Module, SupportsLoRA):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+
+                is_found = True
+                break
+            if is_found:
+                continue
+
+            for (param_name, weight_name, den, split_param, func) in split_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                if is_pp_missing_parameter(name, self):
+                    continue
+
+                assert loaded_weight.shape[0] % den == 0
+                units = loaded_weight.shape[0] // den
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                offset = 0
+                for shard_id, num in split_param:
+                    new_offset = offset + num * units
+                    if func:
+                        weight_loader(param, func(loaded_weight)[offset:new_offset], shard_id)
+                    else:
+                        weight_loader(param, loaded_weight[offset:new_offset], shard_id)
+                    offset = new_offset
 
                 break
             else:
